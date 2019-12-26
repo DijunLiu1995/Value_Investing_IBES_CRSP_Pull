@@ -1,0 +1,55 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(RPostgres)
+wrds <- dbConnect(Postgres(),
+                  host='wrds-pgdata.wharton.upenn.edu',
+                  port=9737,
+                  dbname='wrds',
+                  sslmode='require',
+                  user='echoi98')
+library(fuzzywuzzyR)
+library(tidyverse)
+library(dbplyr)
+library(reticulate)
+```
+
+```{r}
+res <- dbSendQuery(wrds, "select ticker, cusip, cname,sdates, exchcd from ibes.idsum
+                   where cusip !=' ' and sdates between '1980-01-01' and '2018-12-31'
+                   order by idsum.cusip")
+ibes_names<- dbFetch(res, n=-1)
+dbClearResult(res)
+ibes_names <- ibes_names %>% group_by(ticker, cusip)
+ibes_names
+
+# We want exchange 1 or 2 because that is the code for NYSE and AMEX
+res <- dbSendQuery(wrds, "select permno,ticker,cusip,  ncusip, comnam, namedt, exchcd from crsp.stocknames where ncusip !='' and 
+                   (exchcd = 1 or exchcd = 2) ")
+crsp_names<- dbFetch(res, n=-1)
+dbClearResult(res)
+crsp_names <- crsp_names %>% group_by(ticker,ncusip)
+crsp_names
+
+# We only need to apply the filter of exchange once because of innerjoin
+linked_cusips <- inner_join(crsp_names, ibes_names, by = c("ncusip"="cusip"))
+linked_cusips<- linked_cusips %>% distinct (ticker.x, .keep_all = TRUE)
+linked_cusips<- linked_cusips %>% group_by(ticker.x,cusip)
+col_names <- c("permno","ticker.x","ncusip","cname","exchcd.x")
+linked_cusips <- linked_cusips[,col_names]
+linked_cusips <- rename(linked_cusips,ticker=ticker.x,cusip=ncusip,company_name=cname,exchange=exchcd.x)
+linked_cusips$exchange[which(linked_cusips$exchange == "1")] = "NYSE"
+linked_cusips$exchange[which(linked_cusips$exchange == "2")] = "AMEX"
+linked_cusips
+```
+```{r}
+write.csv(linked_cusips, "IBES_to_CRSP_Linked_By_Cusip.csv")
+```
+

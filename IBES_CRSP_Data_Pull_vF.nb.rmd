@@ -1,0 +1,183 @@
+---
+title: "IBES_CRSP_vF"
+author: "Elliott Choi"
+date: "12/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Library needed
+```{r}
+library(RPostgres)
+wrds <- dbConnect(Postgres(),
+                  host='wrds-pgdata.wharton.upenn.edu',
+                  port=9737,
+                  dbname='wrds',
+                  sslmode='require',
+                  user='echoi98')
+library(fuzzywuzzyR)
+library(tidyverse)
+library(dbplyr)
+library(reticulate)
+library(magrittr)
+```
+
+Read in CSV File needed for comparison
+```{r}
+stock_database<-read.csv("IBES_to_CRSP_Linked_By_Cusip.csv",header=TRUE)
+stock_database
+```
+Server Query CRSP Data for all companies in the file 
+```{r}
+res <- dbSendQuery(wrds, "select date,permno, cusip,prc, ret, vol, shrout ,hexcd from crspa.msf
+                   where date between '1980-01-01'
+                   and '2018-12-31' and (hexcd = 1 or hexcd=2)")
+crsp_data <- dbFetch(res, n=-1)
+dbClearResult(res)
+crsp_data <- crsp_data %>%group_by(permno,cusip)
+crsp_data
+```
+Organize and rearrange the data 
+```{r}
+crsp_data <- crsp_data %>%group_by(permno,cusip)
+crsp_data <- rename(crsp_data, price= prc, monthly_returns=ret, volume = vol, shares_outstanding = shrout, exchange = hexcd)
+crsp_data$market_capitalization <- crsp_data$price*crsp_data$shares_outstanding
+crsp_data$exchange[which(crsp_data$exchange == "1")] = "NYSE"
+crsp_data$exchange[which(crsp_data$exchange == "2")] = "AMEX"
+crsp_data$year <- format(crsp_data$date,"%Y")
+crsp_data$month <- format(crsp_data$date,"%m")
+col_order <- c("year", "month", "permno","cusip", "price","monthly_returns","volume","shares_outstanding","market_capitalization","exchange")
+crsp_data <- crsp_data[,col_order]
+crsp_data
+```
+Filter to ensure we only have companies in both databases
+```{r}
+conglomerate_data <- inner_join(stock_database,crsp_data, by= c('cusip'='cusip'))
+conglomerate_data <- rename(conglomerate_data, permno=permno.x, exchange=exchange.x)
+col_order <- c("X","year", "month", "permno","cusip","ticker","company_name","monthly_returns","price","shares_outstanding","volume","market_capitalization","exchange")
+conglomerate_data<-conglomerate_data[,col_order]
+conglomerate_data
+```
+```{r}
+conglomerate_data_cusip <- subset(stock_database, select = c('cusip'))
+conglomerate_data_cusip
+```
+
+Server Query IBES Data
+```{r}
+res <- dbSendQuery(wrds, "select anndats,fpedats, cusip, oftic, analys, value from ibes.detu_epsus
+                   where fpedats between '1980-01-01' and '2019-12-31'
+                   and cusip !=''")
+ibes_pull<- dbFetch(res, n=-1)
+dbClearResult(res)
+```
+Filter the data
+```{r}
+ibes_pull
+ibes_pull_v1<-ibes_pull
+# Rename columns
+ibes_pull_v1$analyst_predict_year <- format(ibes_pull_v1$anndats,"%Y")
+ibes_pull_v1$analyst_predict_month <- format(ibes_pull_v1$anndats,"%m")
+ibes_pull_v1$analyst_predict_year_month <- format(ibes_pull_v1$anndats,"%m-%Y")
+ibes_pull_v1 <- rename(ibes_pull_v1, forecast_end_period = fpedats, analyst=analys, f_eps = value)
+ibes_pull_v1<- ibes_pull_v1 %>% group_by(analyst_predict_year, analyst_predict_month,forecast_end_period,cusip)%>% mutate(number_of_estimates = n_distinct(analyst))
+ibes_pull_v1 <- ibes_pull_v1 %>% filter(number_of_estimates >=3)
+ibes_pull_v1$forecast_end_period_month <- format(ibes_pull_v1$forecast_end_period,"%m")
+ibes_pull_v1<- ibes_pull_v1%>%filter(str_detect(forecast_end_period_month,"12"))
+ibes_pull_v1
+```
+rename the columns we want and adjust order
+```{r}
+ibes_pull_v1 <- rename(ibes_pull_v1, ticker = oftic)
+col_order <- c("cusip","ticker","f_eps","analyst","analyst_predict_year","analyst_predict_month","analyst_predict_year_month","forecast_end_period","number_of_estimates")
+ibes_pull_v1<-ibes_pull_v1[,col_order]
+ibes_pull_v1
+```
+Filter to ensure at least 20 data points 
+```{r}
+ibes_pull_v1<- ibes_pull_v1 %>% group_by(cusip)%>% mutate(number_of_periods = n_distinct(analyst_predict_year_month))
+ibes_pull_v1 <- ibes_pull_v1%>% filter(number_of_periods>=20)
+ibes_pull_v1
+```
+Filter down to make sure the size is more manageable 
+```{r}
+ibes_pull_v2 <- inner_join(ibes_pull_v1,conglomerate_data_cusip,by = c("cusip"="cusip"))
+ibes_pull_v2
+```
+```{r}
+ibes_pull_v2 <- arrange(ibes_pull_v2,cusip,analyst_predict_year_month)
+ibes_pull_v2
+```
+Further Filtering
+```{r}
+conglomerate_data_cusip <- subset(conglomerate_data, select = c('cusip'))
+conglomerate_data_cusip <- distinct(conglomerate_data_cusip)
+conglomerate_data_cusip
+```
+```{r}
+ibes_pull_v3 <- inner_join(ibes_pull_v2,conglomerate_data_cusip,by=c('cusip'='cusip'))
+ibes_pull_v3 <-arrange(ibes_pull_v3,cusip,analyst_predict_year,analyst_predict_month)
+ibes_pull_v3
+```
+Ensure that analysts records are only counted once per month 
+```{r}
+ibes_pull_v4<-ibes_pull_v3%>%group_by(cusip,analyst_predict_year_month)%>%distinct(analyst,.keep_all = TRUE)
+col_order<- c('cusip','ticker','f_eps','analyst','analyst_predict_year','analyst_predict_month','analyst_predict_year_month',
+              'forecast_end_period','number_of_estimates','number_of_periods')
+ibes_pull_v4 <- ibes_pull_v4[,col_order]
+ibes_pull_v4
+```
+Link back to original 
+```{r}
+conglomerate_data_v2<- inner_join(ibes_pull_v4, conglomerate_data,by = c('cusip'='cusip','analyst_predict_month'='month','analyst_predict_year'='year'))
+conglomerate_data_v2
+```
+Filter to ensure that the data is consecutive and starts from january 
+```{r}
+distinct_cusip_forecast_filter <- conglomerate_data_v2 %>%group_by(cusip,analyst_predict_year,analyst_predict_month)%>%distinct(analyst_predict_year_month)
+distinct_cusip_forecast_filter
+
+temp_cusip <-''
+number_of_consecutives<-0
+previous_month<-0
+filter_count<-0
+
+temp_filter_file <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("analyst_predict_year_month", "cusip", "analyst_predict_year","analyst_predict_month")
+colnames(temp_filter_file) <- x
+
+for(row in 1:nrow(distinct_cusip_forecast_filter)){
+
+  current_cusip <- distinct_cusip_forecast_filter[row,'cusip']
+  # If we are on a new cusip
+  if(current_cusip != temp_cusip){
+    temp_cusip <- current_cusip
+    # New company for us to track 
+    number_of_consecutives <-0
+    previous_month<-0
+  }
+  # If this is the start of the consecutive months
+  if((distinct_cusip_forecast_filter[row,'analyst_predict_month'] =='01') & (number_of_consecutives ==0)){
+    # Signals the start of counting consecutive months
+    number_of_consecutives<- number_of_consecutives+1
+    previous_month<-'01'
+  }
+  # If Feb and the previous line was month 01 (january)
+  else if((distinct_cusip_forecast_filter[row,'analyst_predict_month'] =='02') & (previous_month == '01')){
+    # Signals the start of counting consecutive months
+    number_of_consecutives<- number_of_consecutives+1
+    previous_month<-'01'
+  }
+  # We are already counting
+  else if ((number_of_consecutives!=0))&(){
+
+  }
+
+}
+```
+
+
+
